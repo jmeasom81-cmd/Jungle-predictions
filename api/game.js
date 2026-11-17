@@ -44,7 +44,7 @@ async function state(c,req) {
  from ranked where rank=1 and points>0
  union all select title,player,points,'Perfect round' as trophy from ranked where correct=valid_questions
  order by title,player,trophy limit 200`);
- return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id)})),leaderboard,trophies};
+ return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id)})),leaderboard,trophies,...(me&&process.env.JOIN_CODE?{inviteCode:process.env.JOIN_CODE}:{})};
 }
 async function join(c,b) {
  if(!process.env.JOIN_CODE||!equal(b.invite,process.env.JOIN_CODE))fail(403,'Invalid invite code');
