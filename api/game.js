@@ -1,0 +1,105 @@
+const { Pool } = require('pg');
+const { randomUUID, randomBytes, createHash, timingSafeEqual } = require('node:crypto');
+let pool;
+const hash = v => createHash('sha256').update(v).digest('hex');
+const equal = (a,b) => typeof a==='string' && typeof b==='string' && timingSafeEqual(Buffer.from(hash(a)),Buffer.from(hash(b)));
+const fail = (status,message) => { const e=new Error(message);e.status=status;throw e; };
+const clean = (v,max=300) => typeof v==='string' && v.trim().length>0 && v.trim().length<=max ? v.trim() : fail(400,'Invalid text field');
+const uuid = v => typeof v==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? v : fail(400,'Invalid ID');
+const date = v => typeof v==='string' && /(?:Z|[+-]\d\d:\d\d)$/i.test(v) && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : fail(400,'A timestamp with timezone is required');
+const token = req => (req.headers.authorization||'').match(/^Bearer ([^ ]+)$/i)?.[1]||'';
+async function getPlayer(c,req,required=true) {
+ const t=token(req);const r=t?await c.query('select id,display_name from jungle.players where token_hash=$1',[hash(t)]):{rows:[]};
+ if(required&&!r.rows.length)fail(401,'Join the game first');return r.rows[0]||null;
+}
+function admin(req){return !!process.env.GAME_MASTER_SECRET && equal(token(req),process.env.GAME_MASTER_SECRET)}
+const requireAdmin = req => {if(!admin(req))fail(403,'Game master access required')};
+async function state(c,req) {
+ const me=await getPlayer(c,req,false), isAdmin=admin(req);
+ const {rows:rounds}=await c.query('select id,round_key,title,category,opens_at,closes_at,clock_timestamp()>=closes_at as locked from jungle.rounds where opens_at<=clock_timestamp() or $1 order by closes_at desc limit 100',[isAdmin]);
+ const {rows:questions}=await c.query(`select q.id,q.round_id,q.position,q.prompt,q.options,q.points,q.resolution_rule,q.status,
+ case when r.closes_at<=clock_timestamp() then q.answer end as answer,
+ case when r.closes_at<=clock_timestamp() then q.evidence end as evidence,
+ p.choice as my_choice from jungle.questions q join jungle.rounds r on r.id=q.round_id
+ left join jungle.predictions p on p.question_id=q.id and p.player_id=$2
+ where q.round_id=any($1::uuid[]) order by q.position`,[rounds.map(r=>r.id),me?.id||null]);
+ const {rows:leaderboard}=await c.query(`select pl.display_name as name,coalesce(sum(case when q.status='settled' and q.answer=p.choice then q.points else 0 end),0)::int as points,
+ count(*) filter(where q.status='settled' and q.answer=p.choice)::int as correct
+ from jungle.players pl left join jungle.predictions p on p.player_id=pl.id left join jungle.questions q on q.id=p.question_id
+ group by pl.id,pl.display_name order by points desc,correct desc,pl.display_name asc limit 100`);
+ return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id)})),leaderboard};
+}
+async function join(c,b) {
+ if(!process.env.JOIN_CODE||!equal(b.invite,process.env.JOIN_CODE))fail(403,'Invalid invite code');
+ const name=clean(b.name,40);if(name.length<2)fail(400,'Use at least two characters');
+ const t=randomBytes(32).toString('base64url'), id=randomUUID();
+ const r=await c.query('insert into jungle.players(id,display_name,token_hash) values($1,$2,$3) on conflict do nothing returning id,display_name',[id,name,hash(t)]);
+ if(!r.rows.length)fail(409,'That display name is already taken');return {token:t,player:r.rows[0]};
+}
+async function submit(c,b,req) {
+ const player=await getPlayer(c,req);const id=uuid(b.roundId);
+ if(!Array.isArray(b.answers)||!b.answers.length||b.answers.length>30)fail(400,'Invalid predictions');
+ const r=(await c.query('select *, opens_at<=clock_timestamp() and closes_at>clock_timestamp() as open from jungle.rounds where id=$1 for share',[id])).rows[0];
+ if(!r||!r.open)fail(409,'This round is not open');
+ const qs=(await c.query('select id,options from jungle.questions where round_id=$1',[id])).rows;
+ const seen=new Set();
+ for(const a of b.answers){
+  const question=qs.find(q=>q.id===a.questionId);if(!question||seen.has(a.questionId)||!question.options.includes(a.choice))fail(400,'Invalid answer');
+  seen.add(a.questionId);
+  const s=await c.query(`insert into jungle.predictions(player_id,question_id,choice) select $1,$2,$3 where exists(select 1 from jungle.rounds where id=$4 and opens_at<=clock_timestamp() and closes_at>clock_timestamp())
+  on conflict(player_id,question_id) do update set choice=excluded.choice,updated_at=clock_timestamp() returning question_id`,[player.id,question.id,a.choice,id]);
+  if(!s.rowCount)fail(409,'The deadline has passed');
+ }
+ return {saved:seen.size};
+}
+async function publish(c,b) {
+ const roundKey=clean(b.roundKey,100),title=clean(b.title,100);
+ if(!['daily','trial','survivor','eviction','champion','final'].includes(b.category))fail(400,'Invalid category');
+ const opens=date(b.opensAt),closes=date(b.closesAt);
+ if(Date.parse(closes)<=Date.parse(opens)||Date.parse(closes)<=Date.now())fail(400,'Deadline must be in the future');
+ if(!Array.isArray(b.questions)||b.questions.length<1||b.questions.length>15)fail(400,'Invalid question count');
+ const questions=b.questions.map(q=>{
+  if(!Array.isArray(q.options)||q.options.length<2||q.options.length>35)fail(400,'Invalid options');
+  const options=q.options.map(o=>clean(o,100));if(new Set(options.map(o=>o.toLowerCase())).size!==options.length)fail(400,'Duplicate options');
+  if(!Number.isInteger(q.points)||q.points<1||q.points>20)fail(400,'Invalid points');
+  return {prompt:clean(q.prompt,300),resolutionRule:clean(q.resolutionRule,1000),options,points:q.points};
+ });
+ const id=randomUUID();
+ const r=await c.query('insert into jungle.rounds(id,round_key,title,category,opens_at,closes_at) values($1,$2,$3,$4,$5,$6) on conflict(round_key) do nothing returning id',[id,roundKey,title,b.category,opens,closes]);
+ if(!r.rowCount)return {created:false,id:(await c.query('select id from jungle.rounds where round_key=$1',[roundKey])).rows[0].id};
+ for(const [i,q] of questions.entries())await c.query('insert into jungle.questions(id,round_id,position,prompt,options,points,resolution_rule) values($1,$2,$3,$4,$5::jsonb,$6,$7)',[randomUUID(),id,i+1,q.prompt,JSON.stringify(q.options),q.points,q.resolutionRule]);
+ return {created:true,id};
+}
+async function resolve(c,b) {
+ const id=uuid(b.questionId);if(!['settled','void'].includes(b.status))fail(400,'Invalid resolution status');
+ if(!Array.isArray(b.evidence)||!b.evidence.length||b.evidence.length>8)fail(400,'Evidence required');
+ const evidence=b.evidence.map(e=>{let url;try{url=new URL(e.url)}catch{fail(400,'Invalid source URL')}if(url.protocol!=='https:'||url.username||url.password)fail(400,'HTTPS source required');return {url:clean(url.href,1500),summary:clean(e.summary,1000)}});
+ const q=(await c.query('select q.*,r.closes_at<=clock_timestamp() as locked from jungle.questions q join jungle.rounds r on r.id=q.round_id where q.id=$1 for update of q',[id])).rows[0];
+ if(!q)fail(404,'Question not found');if(!q.locked)fail(409,'Round still open');
+ if(q.status!=='pending')fail(409,'Question already resolved');
+ const answer=b.status==='settled'?clean(b.answer,100):null;if(answer!==null&&!q.options.includes(answer))fail(400,'Answer not in options');
+ await c.query('update jungle.questions set status=$2,answer=$3,evidence=$4::jsonb,resolved_at=clock_timestamp() where id=$1',[id,b.status,answer,JSON.stringify(evidence)]);
+ return {resolved:true,id};
+}
+module.exports=async(req,res)=>{
+ res.setHeader('Cache-Control','no-store');res.setHeader('Content-Type','application/json; charset=utf-8');
+ if(!['GET','POST'].includes(req.method)){res.setHeader('Allow','GET, POST');return res.status(405).json({error:'Method not allowed'})}
+ if(!process.env.DATABASE_URL)return res.status(503).json({mode:'setup',error:'Multiplayer database is not connected yet.'});
+ let c,transaction=false;
+ try{
+  if(!pool)pool=new Pool({connectionString:process.env.DATABASE_URL,max:3,connectionTimeoutMillis:5000,idleTimeoutMillis:10000});
+  c=await pool.connect();
+  if(req.method==='GET')return res.status(200).json(await state(c,req));
+  const b=typeof req.body==='string'?JSON.parse(req.body):req.body;if(!b||typeof b!=='object'||Array.isArray(b))fail(400,'Invalid JSON');
+  await c.query('begin');transaction=true;let out;
+  switch(b.action){
+   case 'join':out=await join(c,b);break;
+   case 'predict':out=await submit(c,b,req);break;
+   case 'publish':requireAdmin(req);out=await publish(c,b);break;
+   case 'resolve':requireAdmin(req);out=await resolve(c,b);break;
+   default:fail(400,'Unknown action');
+  }
+  await c.query('commit');transaction=false;return res.status(200).json(out);
+ }catch(e){if(c&&transaction)await c.query('rollback').catch(()=>{});if(!e.status)console.error('Jungle API failed',e.code||e.name);return res.status(e.status||500).json({error:e.status?e.message:'Game service unavailable; please try again.'})}
+ finally{if(c)c.release()}
+};
