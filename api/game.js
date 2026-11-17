@@ -16,6 +16,7 @@ function admin(req){return !!process.env.GAME_MASTER_SECRET && equal(token(req),
 const requireAdmin = req => {if(!admin(req))fail(403,'Game master access required')};
 async function state(c,req) {
  const me=await getPlayer(c,req,false), isAdmin=admin(req);
+ if(!me&&!isAdmin)return {mode:'live',player:null,rounds:[],leaderboard:[],trophies:[]};
  const {rows:rounds}=await c.query('select id,round_key,title,category,opens_at,closes_at,clock_timestamp()>=closes_at as locked from jungle.rounds where opens_at<=clock_timestamp() or $1 order by closes_at desc limit 100',[isAdmin]);
  const {rows:questions}=await c.query(`select q.id,q.round_id,q.position,q.prompt,q.options,q.points,q.resolution_rule,q.status,
  case when r.closes_at<=clock_timestamp() then q.answer end as answer,
@@ -27,7 +28,23 @@ async function state(c,req) {
  count(*) filter(where q.status='settled' and q.answer=p.choice)::int as correct
  from jungle.players pl left join jungle.predictions p on p.player_id=pl.id left join jungle.questions q on q.id=p.question_id
  group by pl.id,pl.display_name order by points desc,correct desc,pl.display_name asc limit 100`);
- return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id)})),leaderboard};
+ const {rows:trophies}=await c.query(`with completed as (
+ select r.id,r.title,r.category,count(q.id) filter(where q.status='settled')::int as valid_questions
+ from jungle.rounds r join jungle.questions q on q.round_id=r.id
+ where r.closes_at<=clock_timestamp() group by r.id
+ having count(*) filter(where q.status='pending')=0 and count(*) filter(where q.status='settled')>0
+ ), scores as (
+ select r.id,r.title,r.category,r.valid_questions,pl.display_name as player,
+ sum(case when q.status='settled' and p.choice=q.answer then q.points else 0 end)::int as points,
+ count(*) filter(where q.status='settled' and p.choice=q.answer)::int as correct
+ from completed r join jungle.questions q on q.round_id=r.id join jungle.predictions p on p.question_id=q.id
+ join jungle.players pl on pl.id=p.player_id group by r.id,r.title,r.category,r.valid_questions,pl.id,pl.display_name
+ ), ranked as (select *,dense_rank() over(partition by id order by points desc) as rank from scores)
+ select title,player,points,case when category='daily' then 'Daily champion' else 'Competition champion' end as trophy
+ from ranked where rank=1 and points>0
+ union all select title,player,points,'Perfect round' as trophy from ranked where correct=valid_questions
+ order by title,player,trophy limit 200`);
+ return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id)})),leaderboard,trophies};
 }
 async function join(c,b) {
  if(!process.env.JOIN_CODE||!equal(b.invite,process.env.JOIN_CODE))fail(403,'Invalid invite code');
