@@ -18,25 +18,25 @@ async function state(c,req) {
  const me=await getPlayer(c,req,false), isAdmin=admin(req);
  if(!me&&!isAdmin)return {mode:'live',player:null,rounds:[],leaderboard:[],trophies:[]};
  const {rows:rounds}=await c.query('select id,round_key,title,category,opens_at,closes_at,clock_timestamp()>=closes_at as locked from jungle.rounds where opens_at<=clock_timestamp() or $1 order by closes_at desc limit 100',[isAdmin]);
- const {rows:questions}=await c.query(`select q.id,q.round_id,q.position,q.prompt,q.options,q.points,q.resolution_rule,q.status,
+ const {rows:questions}=await c.query(`select q.id,q.round_id,q.position,q.prompt,q.options,q.points,q.max_choices,q.resolution_rule,q.status,
  case when r.closes_at<=clock_timestamp() then q.answer end as answer,
  case when r.closes_at<=clock_timestamp() then q.evidence end as evidence,
  p.choice as my_choice from jungle.questions q join jungle.rounds r on r.id=q.round_id
  left join jungle.predictions p on p.question_id=q.id and p.player_id=$2
  where q.round_id=any($1::uuid[]) order by q.position`,[rounds.map(r=>r.id),me?.id||null]);
- const {rows:leaderboard}=await c.query(`select pl.display_name as name,coalesce(sum(case when q.status='settled' and q.answer=p.choice then q.points else 0 end),0)::int as points,
- count(*) filter(where q.status='settled' and q.answer=p.choice)::int as correct
+ const {rows:leaderboard}=await c.query(`select pl.display_name as name,coalesce(sum(jungle.score_choice(q.status,q.answer,p.choice,q.points,q.max_choices)),0)::int as points,
+ count(*) filter(where q.status='settled' and jungle.perfect_choice(q.answer,p.choice,q.max_choices))::int as correct
  from jungle.players pl left join jungle.predictions p on p.player_id=pl.id left join jungle.questions q on q.id=p.question_id
  group by pl.id,pl.display_name order by points desc,correct desc,pl.display_name asc limit 100`);
  const {rows:trophies}=await c.query(`with completed as (
  select r.id,r.title,r.category,count(q.id) filter(where q.status='settled')::int as valid_questions
  from jungle.rounds r join jungle.questions q on q.round_id=r.id
- where r.closes_at<=clock_timestamp() group by r.id
+ where r.closes_at<=clock_timestamp() and r.category<>'champion' group by r.id
  having count(*) filter(where q.status='pending')=0 and count(*) filter(where q.status='settled')>0
  ), scores as (
  select r.id,r.title,r.category,r.valid_questions,pl.display_name as player,
- sum(case when q.status='settled' and p.choice=q.answer then q.points else 0 end)::int as points,
- count(*) filter(where q.status='settled' and p.choice=q.answer)::int as correct
+ sum(jungle.score_choice(q.status,q.answer,p.choice,q.points,q.max_choices))::int as points,
+ count(*) filter(where q.status='settled' and jungle.perfect_choice(q.answer,p.choice,q.max_choices))::int as correct
  from completed r join jungle.questions q on q.round_id=r.id join jungle.predictions p on p.question_id=q.id
  join jungle.players pl on pl.id=p.player_id group by r.id,r.title,r.category,r.valid_questions,pl.id,pl.display_name
  ), ranked as (select *,dense_rank() over(partition by id order by points desc) as rank from scores)
@@ -44,7 +44,8 @@ async function state(c,req) {
  from ranked where rank=1 and points>0
  union all select title,player,points,'Perfect round' as trophy from ranked where correct=valid_questions
  order by title,player,trophy limit 200`);
- return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id)})),leaderboard,trophies,...(me&&process.env.JOIN_CODE?{inviteCode:process.env.JOIN_CODE}:{})};
+ const {rows:winnerPot}=me?await c.query(`select p.choice as celebrity,count(*)::int as picks,sum(q.points)::int as potential_points from jungle.predictions p join jungle.questions q on q.id=p.question_id join jungle.rounds r on r.id=q.round_id where p.player_id=$1 and r.category='champion' and q.status<>'void' group by p.choice order by picks desc,p.choice`,[me.id]):{rows:[]};
+ return {mode:'live',player:me,rounds:rounds.map(r=>({...r,questions:questions.filter(q=>q.round_id===r.id&&q.status!=='void')})),leaderboard,trophies,winnerPot,...(me&&process.env.JOIN_CODE?{inviteCode:process.env.JOIN_CODE}:{})};
 }
 async function join(c,b) {
  if(!process.env.JOIN_CODE||!equal(b.invite,process.env.JOIN_CODE))fail(403,'Invalid invite code');
@@ -53,18 +54,19 @@ async function join(c,b) {
  const r=await c.query('insert into jungle.players(id,display_name,token_hash) values($1,$2,$3) on conflict do nothing returning id,display_name',[id,name,hash(t)]);
  if(!r.rows.length)fail(409,'That display name is already taken');return {token:t,player:r.rows[0]};
 }
+function normalChoice(value,q,resolving=false){if(q.max_choices===1){if(typeof value!=='string'||!q.options.includes(value))fail(400,'Invalid answer');return value;}if(!Array.isArray(value)||value.length<1||(!resolving&&value.length>q.max_choices)||value.length>q.options.length||new Set(value).size!==value.length||value.some(v=>typeof v!=='string'||!q.options.includes(v)))fail(400,'Select up to '+q.max_choices+' different campmates');if(value.includes('Nobody is selected')&&value.length!==1)fail(400,'Nobody must be selected on its own');return JSON.stringify([...value].sort());}
 async function submit(c,b,req) {
  const player=await getPlayer(c,req);const id=uuid(b.roundId);
  if(!Array.isArray(b.answers)||!b.answers.length||b.answers.length>30)fail(400,'Invalid predictions');
  const r=(await c.query('select *, opens_at<=clock_timestamp() and closes_at>clock_timestamp() as open from jungle.rounds where id=$1 for share',[id])).rows[0];
  if(!r||!r.open)fail(409,'This round is not open');
- const qs=(await c.query('select id,options from jungle.questions where round_id=$1',[id])).rows;
+ const qs=(await c.query("select id,options,max_choices from jungle.questions where round_id=$1 and status='pending'",[id])).rows;
  const seen=new Set();
  for(const a of b.answers){
-  const question=qs.find(q=>q.id===a.questionId);if(!question||seen.has(a.questionId)||!question.options.includes(a.choice))fail(400,'Invalid answer');
+  const question=qs.find(q=>q.id===a.questionId);if(!question||seen.has(a.questionId))fail(400,'Invalid answer');const choice=normalChoice(a.choice,question);
   seen.add(a.questionId);
   const s=await c.query(`insert into jungle.predictions(player_id,question_id,choice) select $1,$2,$3 where exists(select 1 from jungle.rounds where id=$4 and opens_at<=clock_timestamp() and closes_at>clock_timestamp())
-  on conflict(player_id,question_id) do update set choice=excluded.choice,updated_at=clock_timestamp() returning question_id`,[player.id,question.id,a.choice,id]);
+  on conflict(player_id,question_id) do update set choice=excluded.choice,updated_at=clock_timestamp() returning question_id`,[player.id,question.id,choice,id]);
   if(!s.rowCount)fail(409,'The deadline has passed');
  }
  return {saved:seen.size};
@@ -79,12 +81,12 @@ async function publish(c,b) {
   if(!Array.isArray(q.options)||q.options.length<2||q.options.length>35)fail(400,'Invalid options');
   const options=q.options.map(o=>clean(o,100));if(new Set(options.map(o=>o.toLowerCase())).size!==options.length)fail(400,'Duplicate options');
   if(!Number.isInteger(q.points)||q.points<1||q.points>20)fail(400,'Invalid points');
-  return {prompt:clean(q.prompt,300),resolutionRule:clean(q.resolutionRule,1000),options,points:q.points};
+  const maxChoices=q.maxChoices??1;if(!Number.isInteger(maxChoices)||maxChoices<1||maxChoices>3)fail(400,'Invalid maximum choices');return {prompt:clean(q.prompt,300),resolutionRule:clean(q.resolutionRule,1000),options,points:q.points,maxChoices};
  });
  const id=randomUUID();
  const r=await c.query('insert into jungle.rounds(id,round_key,title,category,opens_at,closes_at) values($1,$2,$3,$4,$5,$6) on conflict(round_key) do nothing returning id',[id,roundKey,title,b.category,opens,closes]);
  if(!r.rowCount)return {created:false,id:(await c.query('select id from jungle.rounds where round_key=$1',[roundKey])).rows[0].id};
- for(const [i,q] of questions.entries())await c.query('insert into jungle.questions(id,round_id,position,prompt,options,points,resolution_rule) values($1,$2,$3,$4,$5::jsonb,$6,$7)',[randomUUID(),id,i+1,q.prompt,JSON.stringify(q.options),q.points,q.resolutionRule]);
+ for(const [i,q] of questions.entries())await c.query('insert into jungle.questions(id,round_id,position,prompt,options,points,resolution_rule,max_choices) values($1,$2,$3,$4,$5::jsonb,$6,$7,$8)',[randomUUID(),id,i+1,q.prompt,JSON.stringify(q.options),q.points,q.resolutionRule,q.maxChoices]);
  return {created:true,id};
 }
 async function resolve(c,b) {
@@ -94,7 +96,7 @@ async function resolve(c,b) {
  const q=(await c.query('select q.*,r.closes_at<=clock_timestamp() as locked from jungle.questions q join jungle.rounds r on r.id=q.round_id where q.id=$1 for update of q',[id])).rows[0];
  if(!q)fail(404,'Question not found');if(!q.locked)fail(409,'Round still open');
  if(q.status!=='pending')fail(409,'Question already resolved');
- const answer=b.status==='settled'?clean(b.answer,100):null;if(answer!==null&&!q.options.includes(answer))fail(400,'Answer not in options');
+ const answer=b.status==='settled'?normalChoice(b.answer,q,true):null;
  await c.query('update jungle.questions set status=$2,answer=$3,evidence=$4::jsonb,resolved_at=clock_timestamp() where id=$1',[id,b.status,answer,JSON.stringify(evidence)]);
  return {resolved:true,id};
 }
