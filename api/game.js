@@ -54,6 +54,29 @@ async function join(c,b) {
  const r=await c.query('insert into jungle.players(id,display_name,token_hash) values($1,$2,$3) on conflict do nothing returning id,display_name',[id,name,hash(t)]);
  if(!r.rows.length)fail(409,'That display name is already taken');return {token:t,player:r.rows[0]};
 }
+// Recovery links are bound to the current player token hash, expire and are consumed by rotation.
+const recoverySignature=(payload,tokenHash)=>hash('jungle-recovery-v1:'+payload+':'+tokenHash);
+async function issueRecovery(c,b,req){
+ const isAdmin=admin(req);
+ const me=isAdmin?null:await getPlayer(c,req);
+ const player=(await c.query(isAdmin?'select id,display_name,token_hash from jungle.players where lower(display_name)=lower($1)':'select id,display_name,token_hash from jungle.players where id=$1',[isAdmin?clean(b.name,40):me.id])).rows[0];
+ if(!player)fail(404,'Player not found');
+ const expiry=Math.floor(Date.now()/1000)+172800;
+ const payload=player.id+'.'+expiry+'.'+randomBytes(16).toString('hex');
+ return {code:payload+'.'+recoverySignature(payload,player.token_hash),expiresAt:new Date(expiry*1000).toISOString()};
+}
+async function recover(c,b){
+ const code=typeof b.code==='string'?b.code:'';
+ const match=code.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([0-9]{10})\.([0-9a-f]{32})\.([0-9a-f]{64})$/);
+ const invalid=()=>fail(403,'This recovery link is invalid, expired, or already used. Ask your game host for another one.');
+ if(!match||Number(match[2])<=Math.floor(Date.now()/1000))invalid();
+ const [,id,expiry,nonce,signature]=match;
+ const player=(await c.query('select id,display_name,token_hash from jungle.players where id=$1 for update',[id])).rows[0];
+ if(!player||!equal(signature,recoverySignature(id+'.'+expiry+'.'+nonce,player.token_hash)))invalid();
+ const t=randomBytes(32).toString('base64url');
+ await c.query('update jungle.players set token_hash=$2 where id=$1',[id,hash(t)]);
+ return {token:t,player:{id:player.id,display_name:player.display_name}};
+}
 function normalChoice(value,q,resolving=false){if(q.max_choices===1){if(typeof value!=='string'||!q.options.includes(value))fail(400,'Invalid answer');return value;}if(!Array.isArray(value)||value.length<1||(!resolving&&value.length>q.max_choices)||value.length>q.options.length||new Set(value).size!==value.length||value.some(v=>typeof v!=='string'||!q.options.includes(v)))fail(400,'Select up to '+q.max_choices+' different campmates');if(value.includes('Nobody is selected')&&value.length!==1)fail(400,'Nobody must be selected on its own');return JSON.stringify([...value].sort());}
 async function submit(c,b,req) {
  const player=await getPlayer(c,req);const id=uuid(b.roundId);
@@ -113,6 +136,8 @@ module.exports=async(req,res)=>{
   await c.query('begin');transaction=true;let out;
   switch(b.action){
    case 'join':out=await join(c,b);break;
+   case 'issueRecovery':out=await issueRecovery(c,b,req);break;
+   case 'recover':out=await recover(c,b);break;
    case 'predict':out=await submit(c,b,req);break;
    case 'publish':requireAdmin(req);out=await publish(c,b);break;
    case 'resolve':requireAdmin(req);out=await resolve(c,b);break;
