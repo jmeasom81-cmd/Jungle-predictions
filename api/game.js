@@ -1,6 +1,10 @@
 const { Pool } = require('pg');
 const { randomUUID, randomBytes, createHash, timingSafeEqual } = require('node:crypto');
 let pool;
+// One-time, authenticated player-specific deadline exception for tonight only.
+const BELLA_EXTENSION_END = '2026-11-22T21:10:00.000Z';
+const BELLA_EXTENSION_ROUNDS = new Set(['daily-2026-11-22','winner-2026-11-22','next-camp-leader-after-wayne-2026']);
+const bellaRound = (player,roundKey) => player?.display_name?.toLowerCase() === 'bella' && BELLA_EXTENSION_ROUNDS.has(roundKey);
 const hash = v => createHash('sha256').update(v).digest('hex');
 const equal = (a,b) => typeof a==='string' && typeof b==='string' && timingSafeEqual(Buffer.from(hash(a)),Buffer.from(hash(b)));
 const fail = (status,message) => { const e=new Error(message);e.status=status;throw e; };
@@ -18,6 +22,7 @@ async function state(c,req) {
  const me=await getPlayer(c,req,false), isAdmin=admin(req);
  if(!me&&!isAdmin)return {mode:'live',player:null,rounds:[],leaderboard:[],trophies:[]};
  const {rows:rounds}=await c.query('select id,round_key,title,category,opens_at,closes_at,clock_timestamp()>=closes_at as locked from jungle.rounds where opens_at<=clock_timestamp() or $1 order by closes_at desc limit 100',[isAdmin]);
+ for(const round of rounds){if(bellaRound(me,round.round_key)){round.closes_at=BELLA_EXTENSION_END;round.locked=Date.now()>=Date.parse(BELLA_EXTENSION_END)}}
  const {rows:questions}=await c.query(`select q.id,q.round_id,q.position,q.prompt,q.options,q.points,q.max_choices,q.resolution_rule,q.status,
  case when r.closes_at<=clock_timestamp() then q.answer end as answer,
  case when r.closes_at<=clock_timestamp() then q.evidence end as evidence,
@@ -82,14 +87,14 @@ async function submit(c,b,req) {
  const player=await getPlayer(c,req);const id=uuid(b.roundId);
  if(!Array.isArray(b.answers)||!b.answers.length||b.answers.length>30)fail(400,'Invalid predictions');
  const r=(await c.query('select *, opens_at<=clock_timestamp() and closes_at>clock_timestamp() as open from jungle.rounds where id=$1 for share',[id])).rows[0];
- if(!r||!r.open)fail(409,'This round is not open');
+ if(!r||(!r.open&&!(bellaRound(player,r.round_key)&&Date.now()<Date.parse(BELLA_EXTENSION_END))))fail(409,'This round is not open');
  const qs=(await c.query("select id,options,max_choices from jungle.questions where round_id=$1 and status='pending'",[id])).rows;
  const seen=new Set();
  for(const a of b.answers){
   const question=qs.find(q=>q.id===a.questionId);if(!question||seen.has(a.questionId))fail(400,'Invalid answer');const choice=normalChoice(a.choice,question);
   seen.add(a.questionId);
-  const s=await c.query(`insert into jungle.predictions(player_id,question_id,choice) select $1,$2,$3 where exists(select 1 from jungle.rounds where id=$4 and opens_at<=clock_timestamp() and closes_at>clock_timestamp())
-  on conflict(player_id,question_id) do update set choice=excluded.choice,updated_at=clock_timestamp() returning question_id`,[player.id,question.id,choice,id]);
+  const s=await c.query(`insert into jungle.predictions(player_id,question_id,choice) select $1,$2,$3 where exists(select 1 from jungle.rounds where id=$4 and opens_at<=clock_timestamp() and (closes_at>clock_timestamp() or ($5::boolean and clock_timestamp() < $6::timestamptz)))
+  on conflict(player_id,question_id) do update set choice=excluded.choice,updated_at=clock_timestamp() returning question_id`,[player.id,question.id,choice,id,bellaRound(player,r.round_key),BELLA_EXTENSION_END]);
   if(!s.rowCount)fail(409,'The deadline has passed');
  }
  return {saved:seen.size};
@@ -116,8 +121,8 @@ async function resolve(c,b) {
  const id=uuid(b.questionId);if(!['settled','void'].includes(b.status))fail(400,'Invalid resolution status');
  if(!Array.isArray(b.evidence)||!b.evidence.length||b.evidence.length>8)fail(400,'Evidence required');
  const evidence=b.evidence.map(e=>{let url;try{url=new URL(e.url)}catch{fail(400,'Invalid source URL')}if(url.protocol!=='https:'||url.username||url.password)fail(400,'HTTPS source required');return {url:clean(url.href,1500),summary:clean(e.summary,1000)}});
- const q=(await c.query('select q.*,r.closes_at<=clock_timestamp() as locked from jungle.questions q join jungle.rounds r on r.id=q.round_id where q.id=$1 for update of q',[id])).rows[0];
- if(!q)fail(404,'Question not found');if(!q.locked)fail(409,'Round still open');
+ const q=(await c.query('select q.*,r.round_key,r.closes_at<=clock_timestamp() as locked from jungle.questions q join jungle.rounds r on r.id=q.round_id where q.id=$1 for update of q',[id])).rows[0];
+ if(!q)fail(404,'Question not found');if(!q.locked || (BELLA_EXTENSION_ROUNDS.has(q.round_key) && Date.now()<Date.parse(BELLA_EXTENSION_END)))fail(409,'Round still open');
  if(q.status!=='pending')fail(409,'Question already resolved');
  const answer=b.status==='settled'?normalChoice(b.answer,q,true):null;
  await c.query('update jungle.questions set status=$2,answer=$3,evidence=$4::jsonb,resolved_at=clock_timestamp() where id=$1',[id,b.status,answer,JSON.stringify(evidence)]);
